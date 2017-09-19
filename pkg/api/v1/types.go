@@ -86,6 +86,8 @@ const (
 	WorkflowComplete WorkflowConditionType = "Complete"
 	// WorkflowFailed means the workflow has failed its execution.
 	WorkflowFailed WorkflowConditionType = "Failed"
+	// WorkflowUpdateReject means the workflow update attempt was rejected.
+	WorkflowRejectUpdate WorkflowConditionType = "RejectedUpdate"
 )
 
 // WorkflowCondition represent the condition of the Workflow

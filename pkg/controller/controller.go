@@ -20,8 +20,8 @@ import (
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/watch"
 
+	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -110,18 +110,21 @@ func NewWorkflowController(workflowClient *rest.RESTClient, workflowScheme *runt
 
 	wc.JobControl = &WorkflowJobControl{kubeClient, wc.Recorder}
 
-	wc.JobInformer = cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				return wc.KubeClient.BatchV1().Jobs(apiv1.NamespaceAll).List(options)
-			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return wc.KubeClient.BatchV1().Jobs(apiv1.NamespaceAll).Watch(options)
-			},
-		},
-		&batch.Job{},
-		time.Duration(1*time.Minute),
-		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	factory := informers.NewSharedInformerFactory(kubeClient, time.Duration(1*time.Minute))
+	wc.JobInformer = factory.Batch().V1().Jobs().Informer()
+
+	// wc.JobInformer = cache.NewSharedIndexInformer(
+	// 	&cache.ListWatch{
+	// 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+	// 			return wc.KubeClient.BatchV1().Jobs(apiv1.NamespaceAll).List(options)
+	// 		},
+	// 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+	// 			return wc.KubeClient.BatchV1().Jobs(apiv1.NamespaceAll).Watch(options)
+	// 		},
+	// 	},
+	// 	&batch.Job{},
+	// 	time.Duration(1*time.Minute),
+	// 	cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 
 	wc.JobInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
@@ -240,6 +243,20 @@ func (w *WorkflowController) sync(key string) error {
 		return nil
 	}
 	sharedWorkflow := obj.(*wapi.Workflow)
+	// check if direct update is required
+	conditionsLen := len(sharedWorkflow.Status.Conditions)
+	if conditionsLen > 0 &&
+		sharedWorkflow.Status.Conditions[conditionsLen-1].Type == wapi.WorkflowRejectUpdate &&
+		sharedWorkflow.Status.Conditions[conditionsLen-1].Status == apiv1.ConditionUnknown {
+		sharedWorkflow.Status.Conditions[conditionsLen-1].Status = apiv1.ConditionTrue
+		if err := w.updateHandler(sharedWorkflow); err != nil {
+			glog.Errorf("WorkflowController.sync unable to update Workflow status %s/%s:%v", namespace, name, err)
+			return fmt.Errorf("unable to update Workflow %s/%s:%v", namespace, name, err)
+		}
+		glog.V(6).Infof("WorkflowController.sync Updated %s/%s", namespace, name)
+		return nil
+
+	}
 	// Defaulting...
 	if !sharedWorkflow.Status.Validated && // a Workflow validated has been already defaulted
 		!wapi.IsWorkflowDefaulted(sharedWorkflow) {
@@ -308,6 +325,13 @@ func newDeadlineExceededCondition() wapi.WorkflowCondition {
 	return newCondition(wapi.WorkflowFailed, "DeadlineExceeded", "Workflow was active longer than specified deadline")
 }
 
+func newInvalidUpdateCondition() wapi.WorkflowCondition {
+	c := newCondition(wapi.WorkflowRejectUpdate, "RejectedUpdate", "A not authorized update of the status was rejected")
+	c.Status = apiv1.ConditionUnknown
+	return c
+
+}
+
 func newCompletedCondition() wapi.WorkflowCondition {
 	return newCondition(wapi.WorkflowComplete, "", "")
 }
@@ -351,6 +375,12 @@ func (w *WorkflowController) onUpdateWorkflow(oldObj, newObj interface{}) {
 	if IsWorkflowFinished(workflow) {
 		glog.Warning("Update event received on complete Workflow:%s/%s", workflow.Namespace, workflow.Name)
 		return
+	}
+	previousWorkflow := oldObj.(*wapi.Workflow)
+	if !reflect.DeepEqual(workflow.Status, previousWorkflow.Status) {
+		glog.Errorf("Workflow %s/%s status was modified out of the controller. The update is reverted.", workflow.Namespace, workflow.Name)
+		workflow = previousWorkflow
+		workflow.Status.Conditions = append(workflow.Status.Conditions, newInvalidUpdateCondition())
 	}
 	w.enqueue(workflow)
 }

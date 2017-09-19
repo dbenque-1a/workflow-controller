@@ -3,6 +3,12 @@ Kubernetes workflow controller
 
 ## Running workflow-controller
 
+### prerequisit
+
+- go version >= 1.8.3 
+- docker verison >= 17
+- godeps installed and available in the path
+
 ### locally
 
 ```shell
